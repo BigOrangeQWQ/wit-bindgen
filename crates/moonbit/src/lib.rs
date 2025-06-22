@@ -1,14 +1,15 @@
 use anyhow::Result;
-use core::panic;
+use core::{fmt, panic};
 use heck::{ToLowerCamelCase, ToShoutySnakeCase, ToSnakeCase, ToUpperCamelCase};
+use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt::Write, mem, ops::Deref};
 use wit_bindgen_core::{
     abi::{self, AbiVariant, Bindgen, Bitcast, Instruction, LiftLower, WasmType},
     dealias, uwrite, uwriteln,
     wit_parser::{
         Alignment, ArchitectureSize, Docs, Enum, Flags, FlagsRepr, Function, FunctionKind, Handle,
-        Int, InterfaceId, Record, Resolve, Result_, SizeAlign, Tuple, Type, TypeDef, TypeDefKind,
-        TypeId, TypeOwner, Variant, WorldId, WorldKey,
+        Int, InterfaceId, PackageId, PackageName, Record, Resolve, Result_, SizeAlign, Tuple, Type,
+        TypeDef, TypeDefKind, TypeId, TypeOwner, Variant, WorldId, WorldKey,
     },
     Direction, Files, InterfaceGenerator as _, Ns, Source, WorldGenerator,
 };
@@ -23,6 +24,10 @@ use wit_bindgen_core::{
 // TODO: Export will share the type signatures with the import by using a newtype alias
 
 const FFI_DIR: &str = "ffi";
+
+const FFI_PKG: &str = "BigOrangeQWQ/wit-ffi";
+
+const REPO_OWNER: &str = "BigOrangeQWQ";
 
 const FFI: &str = r#"
 pub extern "wasm" fn extend16(value : Int) -> Int =
@@ -229,10 +234,30 @@ impl Opts {
     }
 }
 
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
 struct InterfaceFragment {
     src: String,
     ffi: String,
     stub: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PackageInfo {
+    name: String,
+
+    imports: HashMap<String, String>, // path, alias
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PackageMods {
+    name: String,
+    deps: HashMap<String, String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Interface {
+    package_name: String,
+    name: String,
 }
 
 #[derive(Default)]
@@ -241,12 +266,82 @@ struct Imports {
     ns: Ns,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct InterfaceInfo {
+    pub package: PackageName,
+    pub interface_name: String,
+    pub name: String,
+}
+
+impl InterfaceInfo {
+    fn new(package: PackageName, name: String) -> Self {
+        let interface_name = name
+            .strip_prefix(&format!(
+                "interface.{}.{}.",
+                package.namespace.to_moonbit_ident(),
+                package.name.to_moonbit_ident()
+            ))
+            .unwrap_or(&name)
+            .to_string();
+
+        InterfaceInfo {
+            package,
+            name,
+            interface_name,
+        }
+    }
+
+    fn pkg_moonbit_ident(&self) -> String {
+        format!(
+            "{}-{}",
+            self.package.namespace.to_moonbit_ident(),
+            self.package.name.to_moonbit_ident()
+        )
+        .replace(".", "-")
+    }
+
+    fn name(&self) -> String {
+        format!("{}.{}", self.pkg_moonbit_ident(), self.interface_name)
+    }
+
+    fn pkg_version(&self) -> String {
+        format!("{}", self.package.version.clone().unwrap())
+    }
+
+    fn pkg_name(&self) -> String {
+        self.package.name.to_moonbit_ident()
+    }
+
+    fn namespace(&self) -> String {
+        self.package.namespace.to_moonbit_ident()
+    }
+
+    fn old_pkg_name(&self) -> String {
+        format!("interface.{}.{}", self.package.namespace, self.package.name)
+    }
+
+    fn old_interface_name(&self) -> String {
+        format!(
+            "interface.{}.{}.{}",
+            self.package.namespace, self.package.name, self.interface_name
+        )
+    }
+}
+
+impl fmt::Display for InterfaceInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.pkg_moonbit_ident(), self.name)
+    }
+}
+
 #[derive(Default)]
 pub struct MoonBit {
     opts: Opts,
     name: String,
     needs_cleanup: bool,
-    import_interface_fragments: HashMap<String, Vec<InterfaceFragment>>,
+    self_package_id: Option<PackageId>,
+    self_package_name: Option<PackageName>,
+    import_interface_fragments: HashMap<InterfaceInfo, Vec<InterfaceFragment>>,
     export_interface_fragments: HashMap<String, Vec<InterfaceFragment>>,
     import_world_fragments: Vec<InterfaceFragment>,
     export_world_fragments: Vec<InterfaceFragment>,
@@ -256,6 +351,7 @@ pub struct MoonBit {
     interface_ns: Ns,
     // dependencies between packages
     package_import: HashMap<String, Imports>,
+    imports_name_transform: HashMap<String, String>,
     export: HashMap<String, String>,
     export_ns: Ns,
     // return area allocation
@@ -271,12 +367,40 @@ impl MoonBit {
         module: &'a str,
         direction: Direction,
     ) -> InterfaceGenerator<'a> {
+        let pkg_name = self.self_package_name.clone();
+
+        let interface = InterfaceInfo::new(pkg_name.unwrap(), name.to_string());
+
         InterfaceGenerator {
             src: String::new(),
             stub: String::new(),
             ffi: String::new(),
             gen: self,
             resolve,
+            info: interface,
+            name,
+            module,
+            direction,
+        }
+    }
+
+    fn import_interface<'a>(
+        &'a mut self,
+        resolve: &'a Resolve,
+        name: &'a str,
+        module: &'a str,
+        direction: Direction,
+        pkg_name: Option<PackageName>,
+    ) -> InterfaceGenerator<'a> {
+        let interface = InterfaceInfo::new(pkg_name.unwrap(), name.to_string());
+
+        InterfaceGenerator {
+            src: String::new(),
+            stub: String::new(),
+            ffi: String::new(),
+            gen: self,
+            resolve,
+            info: interface,
             name,
             module,
             direction,
@@ -286,6 +410,12 @@ impl MoonBit {
 
 impl WorldGenerator for MoonBit {
     fn preprocess(&mut self, resolve: &Resolve, world: WorldId) {
+        self.self_package_id = resolve.worlds[world].package;
+        if let Some(pkg_id) = self.self_package_id {
+            self.self_package_name = Some(resolve.packages[pkg_id].name.clone());
+        } else {
+            panic!("WIT file does not have a package");
+        }
         self.name = world_name(resolve, world);
         self.sizes.fill(resolve);
     }
@@ -301,17 +431,30 @@ impl WorldGenerator for MoonBit {
         let name = self.interface_ns.tmp(&name);
         self.import_interface_names.insert(id, name.clone());
 
-        if let Some(content) = &resolve.interfaces[id].docs.contents {
-            if !content.is_empty() {
-                files.push(
-                    &format!("{}/README.md", name.replace(".", "/")),
-                    content.as_bytes(),
-                );
+        // println!("Importing interface {:?} with id {:?}", name, id);
+        // if let Some(content) = &resolve.interfaces[id].docs.contents {
+        //     if !content.is_empty() {
+        //         files.push(
+        //             &format!("{}/README.md", name.replace(".", "/")),
+        //             content.as_bytes(),
+        //         );
+        //     }
+        // }
+
+        // println!("world {}", resolve.name_world_key(key));
+
+        // println!("Importing interface {:?} with id {:?}", interface.name, interface.package);
+
+        let pkg = match key {
+            WorldKey::Name(_) => None,
+            WorldKey::Interface(id) => {
+                let pkg = resolve.interfaces[*id].package.unwrap();
+                Some(resolve.packages[pkg].name.clone())
             }
-        }
+        };
 
         let module = &resolve.name_world_key(key);
-        let mut gen = self.interface(resolve, &name, module, Direction::Import);
+        let mut gen = self.import_interface(resolve, &name, module, Direction::Import, pkg);
         gen.types(id);
 
         for (_, func) in resolve.interfaces[id].functions.iter() {
@@ -349,6 +492,7 @@ impl WorldGenerator for MoonBit {
     ) -> Result<()> {
         let name = format!("{}.{}", self.opts.gen_dir, interface_name(resolve, key));
         let name = self.interface_ns.tmp(&name);
+
         self.export_interface_names.insert(id, name.clone());
 
         if let Some(content) = &resolve.interfaces[id].docs.contents {
@@ -359,7 +503,6 @@ impl WorldGenerator for MoonBit {
                 );
             }
         }
-
         let module = &resolve.name_world_key(key);
         let mut gen = self.interface(resolve, &name, module, Direction::Export);
         gen.types(id);
@@ -414,32 +557,61 @@ impl WorldGenerator for MoonBit {
             .clone()
             .or(resolve.worlds[id].package.map(|id| {
                 let package = &resolve.packages[id].name;
-                format!("{}/{}", package.namespace, package.name)
+                format!("{}-{}", package.namespace, package.name)
             }))
             .unwrap_or("generated".into());
         let name = world_name(resolve, id);
 
-        if let Some(content) = &resolve.worlds[id].docs.contents {
-            if !content.is_empty() {
-                files.push(
-                    &format!("{}/README.md", name.replace(".", "/")),
-                    content.as_bytes(),
-                );
-            }
-        }
+        println!("Exporting world {} with id {:?}", name, id); //
+
+        // 明天先只生成wit文件声明的 packageid 的包
+
+        let world = &resolve.worlds[id];
+        let package_id = world.package.unwrap();
+        let package = &resolve.packages[package_id];
+        let namespace = &package.name.namespace;
+        let name = &package.name.name;
+        println!("package_id {:?}package {}:{}", package_id, namespace, name);
+        // let names = &resolve.worlds[id].imports.clone();
+        // println!("World {} includes: {:?}", name, names);
+
+        // if let Some(content) = &resolve.worlds[id].docs.contents {
+        //     if !content.is_empty() {
+        //         files.push(
+        //             &format!("{}/README.md", name.replace(".", "/")),
+        //             content.as_bytes(),
+        //         );
+        //     }
+        // }
+
+        // resolve.packages.iter().for_each(|(id, package)| {
+        //     if package.name.to_string() == project_name {
+        //         println!("Found package {} with id", package.name);
+        //     }
+        // });
 
         let version = env!("CARGO_PKG_VERSION");
 
-        let generate_pkg_definition = |name: &String, files: &mut Files| {
+        for (info, _) in &self.import_interface_fragments {
+            self.imports_name_transform
+                .insert(info.name.clone(), info.name());
+        }
+
+        println!("{:?}", self.imports_name_transform);
+
+        // directory
+        let generate_pkg_definition = |name: &String, package_name: &String, files: &mut Files| {
             let directory = name.replace('.', "/");
             let imports: Option<&Imports> = self.package_import.get(name);
+
+            let package_name = package_name.replace(".", "-");
             if let Some(imports) = imports {
                 let mut deps = imports
                     .packages
                     .iter()
                     .map(|(k, v)| {
                         format!(
-                            "{{ \"path\" : \"{project_name}/{}\", \"alias\" : \"{}\" }}",
+                            "{{ \"path\" : \"{REPO_OWNER}/{}\", \"alias\" : \"{}\" }}",
                             k.replace(".", "/"),
                             v
                         )
@@ -449,54 +621,123 @@ impl WorldGenerator for MoonBit {
 
                 files.push(
                     &format!("{directory}/moon.pkg.json"),
-                    format!("{{ \"import\": [{}] }}", deps.join(", ")).as_bytes(),
+                    format!(
+                        "{{ \"name\": \"{REPO_OWNER}/{}\", \"import\": [{}] }}",
+                        format!("{}{}", package_name, name).replace(".", "/"),
+                        deps.join(", ")
+                    )
+                    .as_bytes(),
                 );
             } else {
                 files.push(
                     &format!("{directory}/moon.pkg.json"),
-                    format!("{{ }}").as_bytes(),
+                    format!(
+                        "{{ \"name\": \"{REPO_OWNER}/{}\" }}",
+                        format!("{}{}", package_name, name).replace(".", "/"),
+                    )
+                    .as_bytes(),
                 );
             }
         };
 
-        // Import world fragments
-        let mut src = Source::default();
-        let mut ffi = Source::default();
-        wit_bindgen_core::generated_preamble(&mut src, version);
-        wit_bindgen_core::generated_preamble(&mut ffi, version);
-        self.import_world_fragments.iter().for_each(|f| {
-            uwriteln!(src, "{}", f.src);
-            uwriteln!(ffi, "{}", f.ffi);
-            assert!(f.stub.is_empty());
-        });
+        let generate_import_pkg_definition =
+            |directory: String, info: &InterfaceInfo, files: &mut Files| {
+                let imports = self.package_import.get(&info.name);
+                // println!("{:#?}", self.package_import.keys());
+                // println!("OMG {:?}", self.imports_name_transform);
 
-        let directory = name.replace('.', "/");
-        files.push(&format!("{directory}/import.mbt"), indent(&src).as_bytes());
-        files.push(
-            &format!("{directory}/ffi_import.mbt"),
-            indent(&ffi).as_bytes(),
-        );
-        generate_pkg_definition(&name, files);
+                let package_name = info.name();
+                if let Some(imports) = imports {
+                    let mut deps = imports
+                        .packages
+                        .iter()
+                        .map(|(k, v)| {
+                            if k == FFI_DIR {
+                                // hack ffi to BigOrangeQWQ/ffi
+                                return format!(
+                                    "{{ \"path\" : \"{}\", \"alias\" : \"ffi\" }}",
+                                    FFI_PKG
+                                );
+                            }
+                            format!(
+                                "{{ \"path\" : \"{REPO_OWNER}/{}\", \"alias\" : \"{}\" }}",
+                                self.imports_name_transform
+                                    .get(k)
+                                    .unwrap_or(&k)
+                                    .replace(".", "/"),
+                                v
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    deps.sort();
+
+                    // println!("{:?}", deps);
+
+                    files.push(
+                        &format!("{directory}/moon.pkg.json"),
+                        format!(
+                            "{{ \"name\": \"{REPO_OWNER}/{}\", \"import\": [{}] }}",
+                            format!("{}", package_name).replace(".", "/"),
+                            deps.join(", ")
+                        )
+                        .as_bytes(),
+                    );
+                } else {
+                    files.push(
+                        &format!("{directory}/moon.pkg.json"),
+                        format!(
+                            "{{ \"name\": \"{REPO_OWNER}/{}\" }}",
+                            format!("{}", package_name).replace(".", "/"),
+                        )
+                        .as_bytes(),
+                    );
+                }
+            };
+
+        // Import world fragments
+        // let mut src = Source::default();
+        // let mut ffi = Source::default();
+        // wit_bindgen_core::generated_preamble(&mut src, version);
+        // wit_bindgen_core::generated_preamble(&mut ffi, version);
+        // self.import_world_fragments.iter().for_each(|f| {
+        //     uwriteln!(src, "{}", f.src);
+        //     uwriteln!(ffi, "{}", f.ffi);
+        //     assert!(f.stub.is_empty());
+        // });
+
+        // files.push(&format!("{directory}/import.mbt"), indent(&src).as_bytes());
+        // files.push(
+        //     &format!("{directory}/ffi_import.mbt"),
+        //     indent(&ffi).as_bytes(),
+        // );
+        // generate_pkg_definition(&name, &String::new(), files);
 
         // Export world fragments
-        let mut src = Source::default();
-        let mut stub = Source::default();
-        wit_bindgen_core::generated_preamble(&mut src, version);
-        generated_preamble(&mut stub, version);
-        self.export_world_fragments.iter().for_each(|f| {
-            uwriteln!(src, "{}", f.src);
-            uwriteln!(stub, "{}", f.stub);
-        });
+        // let mut src = Source::default();
+        // let mut stub = Source::default();
+        // wit_bindgen_core::generated_preamble(&mut src, version);
+        // generated_preamble(&mut stub, version);
+        // self.export_world_fragments.iter().for_each(|f| {
+        //     uwriteln!(src, "{}", f.src);
+        //     uwriteln!(stub, "{}", f.stub);
+        // });
 
-        files.push(&format!("{directory}/top.mbt"), indent(&src).as_bytes());
-        if !self.opts.ignore_stub {
-            files.push(
-                &format!("{}/{directory}/stub.mbt", self.opts.gen_dir),
-                indent(&stub).as_bytes(),
-            );
-            generate_pkg_definition(&format!("{}.{}", self.opts.gen_dir, name), files);
-        }
+        // files.push(&format!("{directory}/top.mbt"), indent(&src).as_bytes());
+        // if !self.opts.ignore_stub {
+        //     files.push(
+        //         &format!("{}/{directory}/stub.mbt", self.opts.gen_dir),
+        //         indent(&stub).as_bytes(),
+        //     );
+        //     generate_pkg_definition(
+        //         &format!("{}.{}", self.opts.gen_dir, name),
+        //         &String::new(),
+        //         files,
+        //     );
+        // }
 
+        let directory = name.replace('.', "/");
+
+        // Generate FFI for export world fragments
         let generate_ffi =
             |directory: String, fragments: &[InterfaceFragment], files: &mut Files| {
                 let b = fragments
@@ -525,142 +766,190 @@ impl WorldGenerator for MoonBit {
         for (name, fragments) in &self.import_interface_fragments {
             let mut src = Source::default();
             let mut ffi = Source::default();
+
+            let pkg_name = &resolve.packages[self.self_package_id.unwrap()].name;
+            if name.package != *pkg_name {
+                //
+                continue; // skip if the interface is not in the current package
+            }
+
+            // println!("{} {pkg_name}", name.package);
+
             wit_bindgen_core::generated_preamble(&mut src, version);
             wit_bindgen_core::generated_preamble(&mut ffi, version);
+
             fragments.iter().for_each(|f| {
                 uwriteln!(src, "{}", f.src);
                 uwriteln!(ffi, "{}", f.ffi);
                 assert!(f.stub.is_empty());
             });
 
-            let directory = name.replace('.', "/");
+            // println!("name {:?}", name);
+            let directory = format!("src/{}", name.interface_name).replace(".", "/");
             files.push(&format!("{directory}/top.mbt"), indent(&src).as_bytes());
             files.push(&format!("{directory}/ffi.mbt"), indent(&ffi).as_bytes());
-            generate_pkg_definition(&name, files);
+            generate_import_pkg_definition(directory, &name, files);
         }
 
-        // Export interface fragments
-        for (name, fragments) in &self.export_interface_fragments {
-            let mut src = Source::default();
-            let mut stub = Source::default();
-            wit_bindgen_core::generated_preamble(&mut src, version);
-            generated_preamble(&mut stub, version);
-            fragments.iter().for_each(|f| {
-                uwriteln!(src, "{}", f.src);
-                uwriteln!(stub, "{}", f.stub);
-            });
+        // Export interface fragments 
+        // TODO: virtual package interfaces
+        // for (name, fragments) in &self.export_interface_fragments {
+        //     let mut src = Source::default();
+        //     let mut stub = Source::default();
+        //     wit_bindgen_core::generated_preamble(&mut src, version);
+        //     generated_preamble(&mut stub, version);
+        //     fragments.iter().for_each(|f| {
+        //         uwriteln!(src, "{}", f.src);
+        //         uwriteln!(stub, "{}", f.stub);
+        //     });
 
-            let directory = name.replace('.', "/");
-            files.push(&format!("{directory}/top.mbt"), indent(&src).as_bytes());
-            if !self.opts.ignore_stub {
-                files.push(&format!("{directory}/stub.mbt"), indent(&stub).as_bytes());
-                generate_pkg_definition(&name, files);
-            }
-            generate_ffi(directory, fragments, files);
-        }
+        //     let directory = name.replace('.', "/");
+        //     files.push(&format!("{directory}/top.mbt"), indent(&src).as_bytes());
+        //     if !self.opts.ignore_stub {
+        //         files.push(&format!("{directory}/stub.mbt"), indent(&stub).as_bytes());
+        //         generate_pkg_definition(&name, &String::new(), files);
+        //     }
+        //     generate_ffi(directory, fragments, files);
+        // }
 
         // Export FFI Utils
-        let mut body = Source::default();
-        wit_bindgen_core::generated_preamble(&mut body, version);
-        body.push_str(FFI);
-        files.push(&format!("{FFI_DIR}/top.mbt"), indent(&body).as_bytes());
-        files.push(
-            &format!("{FFI_DIR}/moon.pkg.json"),
-            "{ \"warn-list\": \"-44\", \"supported-targets\": [\"wasm\"] }".as_bytes(),
-        );
+        // let mut body = Source::default();
+        // wit_bindgen_core::generated_preamble(&mut body, version);
+        // body.push_str(FFI);
+        // files.push(&format!("{FFI_DIR}/top.mbt"), indent(&body).as_bytes());
+        // files.push(
+        //     &format!("{FFI_DIR}/moon.pkg.json"),
+        //     "{ \"warn-list\": \"-44\", \"supported-targets\": [\"wasm\"] }".as_bytes(),
+        // );
+
+        let mut pkg_deps: Vec<_> = resolve
+            .packages
+            .iter()
+            .filter_map(|(pkg_id, pkg)| {
+                if let Some(self_pkg_id) = self.self_package_id {
+                    if pkg_id == self_pkg_id {
+                        // println!("Found self package {} with id {:?}", pkg.name, pkg_id);
+                        return None;
+                    }
+                }
+                Some(format!(
+                    "\"{REPO_OWNER}/{}-{}\" : \"{}\"",
+                    pkg.name.namespace,
+                    pkg.name.name,
+                    pkg.name.version.clone().unwrap()
+                ))
+            })
+            .collect();
+
+        pkg_deps.push(format!("\"{FFI_PKG}\": \"0.1.0\""));
+
+        // println!(
+        //     "Exporting project {} with dependencies {}",
+        //     project_name, pkg_deps
+        // );
+
 
         // Export project files
         if !self.opts.ignore_stub && !self.opts.ignore_module_file {
             let mut body = Source::default();
-            uwriteln!(&mut body, "{{ \"name\": \"{project_name}\" }}");
+            uwriteln!(
+                &mut body,
+                "{{ \"name\": \"{REPO_OWNER}/{project_name}\", \"version\" : \"{}\", \"license\": \"Apache-2.0\", \"source\": \"src\", \"deps\": {{ {} }} }}",
+                self.self_package_name.clone().unwrap().version.unwrap(), pkg_deps.join(", ")
+            );
             files.push(&format!("moon.mod.json"), body.as_bytes());
         }
 
-        let export_dir = self.opts.gen_dir.clone();
-
+        // let export_dir = self.opts.gen_dir.clone();
+        // TODO: virtual package interfaces
         // Export project entry point
-        let mut gen = self.interface(resolve, &export_dir.as_str(), "", Direction::Export);
-        let ffi_qualifier = gen.qualify_package(FFI_DIR);
+        // let mut gen = self.interface(resolve, &export_dir.as_str(), "", Direction::Export);
+        // let ffi_qualifier = gen.qualify_package(FFI_DIR);
 
-        let mut body = Source::default();
-        wit_bindgen_core::generated_preamble(&mut body, version);
-        uwriteln!(
-            &mut body,
-            "
-            pub fn cabi_realloc(
-                src_offset : Int,
-                src_size : Int,
-                dst_alignment : Int,
-                dst_size : Int
-            ) -> Int {{
-                {ffi_qualifier}cabi_realloc(src_offset, src_size, dst_alignment, dst_size)
-            }}
-            "
-        );
-        if !self.return_area_size.is_empty() {
-            uwriteln!(
-                &mut body,
-                "
-                let return_area : Int = {ffi_qualifier}malloc({})
-                ",
-                self.return_area_size.size_wasm32(),
-            );
-        }
-        files.push(
-            &format!("{}/ffi.mbt", self.opts.gen_dir),
-            indent(&body).as_bytes(),
-        );
-        self.export
-            .insert("cabi_realloc".into(), "cabi_realloc".into());
+        // let mut body = Source::default();
+        // wit_bindgen_core::generated_preamble(&mut body, version);
+        // uwriteln!(
+        //     &mut body,
+        //     "
+        //     pub fn cabi_realloc(
+        //         src_offset : Int,
+        //         src_size : Int,
+        //         dst_alignment : Int,
+        //         dst_size : Int
+        //     ) -> Int {{
+        //         {ffi_qualifier}cabi_realloc(src_offset, src_size, dst_alignment, dst_size)
+        //     }}
+        //     "
+        // );
+        // if !self.return_area_size.is_empty() {
+        //     uwriteln!(
+        //         &mut body,
+        //         "
+        //         let return_area : Int = {ffi_qualifier}malloc({})
+        //         ",
+        //         self.return_area_size.size_wasm32(),
+        //     );
+        // }
+        // files.push(
+        //     &format!("{}/ffi.mbt", self.opts.gen_dir),
+        //     indent(&body).as_bytes(),
+        // );
+        // self.export
+        //     .insert("cabi_realloc".into(), "cabi_realloc".into());
 
-        let mut body = Source::default();
-        let mut exports = self
-            .export
-            .iter()
-            .map(|(k, v)| format!("\"{k}:{v}\""))
-            .collect::<Vec<_>>();
-        exports.sort();
+        // let mut body = Source::default();
+        // let mut exports = self
+        //     .export
+        //     .iter()
+        //     .map(|(k, v)| format!("\"{k}:{v}\""))
+        //     .collect::<Vec<_>>();
+        // exports.sort();
 
-        uwrite!(
-            &mut body,
-            r#"
-            {{
-                "link": {{
-                    "wasm": {{
-                        "exports": [{}],
-                        "export-memory-name": "memory",
-                        "heap-start-address": 16
-                    }}
-                }}
-            "#,
-            exports.join(", ")
-        );
-        if let Some(imports) = self.package_import.get(&self.opts.gen_dir) {
-            let mut deps = imports
-                .packages
-                .iter()
-                .map(|(k, v)| {
-                    format!(
-                        "{{ \"path\" : \"{project_name}/{}\", \"alias\" : \"{}\" }}",
-                        k.replace(".", "/"),
-                        v
-                    )
-                })
-                .collect::<Vec<_>>();
-            deps.sort();
+        // uwrite!(
+        //     &mut body,
+        //     r#"
+        //     {{
+        //         "link": {{
+        //             "wasm": {{
+        //                 "exports": [{}],
+        //                 "export-memory-name": "memory",
+        //                 "heap-start-address": 16
+        //             }}
+        //         }}
+        //     "#,
+        //     exports.join(", ")
+        // );
 
-            uwrite!(&mut body, "    ,\"import\": [{}]", deps.join(", "));
-        }
-        uwrite!(
-            &mut body,
-            "
-            }}
-            ",
-        );
-        files.push(
-            &format!("{}/moon.pkg.json", self.opts.gen_dir,),
-            indent(&body).as_bytes(),
-        );
+        // if let Some(imports) = self.package_import.get(&self.opts.gen_dir) {
+        //     let mut deps = imports
+        //         .packages
+        //         .iter()
+        //         .map(|(k, v)| {
+        //             if k == FFI_DIR {
+        //                 // hack ffi to BigOrangeQWQ/ffi
+        //                 return format!("{{ \"path\" : \"{}\", \"alias\" : \"ffi\" }}", FFI_PKG);
+        //             }
+        //             format!(
+        //                 "{{ \"path\" : \"{REPO_OWNER}/{}\", \"alias\" : \"{}\" }}",
+        //                 k.replace(".", "/"),
+        //                 v
+        //             )
+        //         })
+        //         .collect::<Vec<_>>();
+        //     deps.sort();
+
+        //     uwrite!(&mut body, "    ,\"import\": [{}]", deps.join(", "));
+        // }
+        // uwrite!(
+        //     &mut body,
+        //     "
+        //     }}
+        //     ",
+        // );
+        // files.push(
+        //     &format!("{}/moon.pkg.json", self.opts.gen_dir,),
+        //     indent(&body).as_bytes(),
+        // );
 
         Ok(())
     }
@@ -673,6 +962,7 @@ struct InterfaceGenerator<'a> {
     gen: &'a mut MoonBit,
     resolve: &'a Resolve,
     // The current interface getting generated
+    info: InterfaceInfo,
     name: &'a str,
     module: &'a str,
     direction: Direction,
@@ -687,6 +977,7 @@ impl InterfaceGenerator<'_> {
                 .entry(
                     // This is a hack: the exported ffi calls are actually under the gen directory
                     if self.direction == Direction::Export && name == FFI_DIR {
+                        // println!("Using FFI_DIR as gen {}", self.gen.opts.gen_dir);
                         self.gen.opts.gen_dir.clone()
                     } else {
                         self.name.to_string()
@@ -709,6 +1000,7 @@ impl InterfaceGenerator<'_> {
             "".into()
         }
     }
+
     fn qualifier(&mut self, ty: &TypeDef) -> String {
         if let TypeOwner::Interface(id) = &ty.owner {
             if let Some(name) = self.gen.export_interface_names.get(id) {
@@ -733,15 +1025,16 @@ impl InterfaceGenerator<'_> {
     fn add_interface_fragment(self) {
         match self.direction {
             Direction::Import => {
+                let fragment = InterfaceFragment {
+                    src: self.src,
+                    stub: self.stub,
+                    ffi: self.ffi,
+                };
                 self.gen
                     .import_interface_fragments
-                    .entry(self.name.to_owned())
+                    .entry(self.info)
                     .or_default()
-                    .push(InterfaceFragment {
-                        src: self.src,
-                        stub: self.stub,
-                        ffi: self.ffi,
-                    });
+                    .push(fragment.clone());
             }
             Direction::Export => {
                 self.gen
@@ -802,7 +1095,7 @@ impl InterfaceGenerator<'_> {
             self.gen.needs_cleanup = true;
 
             let ffi_qualifier = self.qualify_package(FFI_DIR);
-
+            // println!("ffi qualifiet{}", ffi_qualifier);
             format!(
                 r#"let cleanupList : Array[{ffi_qualifier}Cleanup] = []
                    let ignoreList : Array[&{ffi_qualifier}Any] = []"#
@@ -2835,6 +3128,88 @@ fn indent(code: &str) -> Source {
 
 fn world_name(resolve: &Resolve, world: WorldId) -> String {
     format!("world.{}", resolve.worlds[world].name.to_lower_camel_case())
+}
+
+// interface 对应的 package id
+fn world_interface_package(resolve: &Resolve, world: WorldId) -> Option<PackageId> {
+    resolve.worlds[world].package
+}
+
+/// world key 获取 package name
+fn world_package_name(resolve: &Resolve, name: &WorldKey) -> String {
+    let pkg = match name {
+        WorldKey::Name(_) => None,
+        WorldKey::Interface(id) => {
+            let pkg = resolve.interfaces[*id].package.unwrap();
+            Some(resolve.packages[pkg].name.clone())
+        }
+    };
+
+    if let Some(name) = &pkg {
+        format!(
+            "{}.{}.",
+            name.namespace.to_moonbit_ident(),
+            name.name.to_moonbit_ident()
+        )
+    } else {
+        String::new()
+    }
+}
+
+fn interface_name_id(resolve: &Resolve, id: InterfaceId) -> String {
+    let pkg = resolve.interfaces[id].package.unwrap();
+    let pkg_name = &resolve.packages[pkg].name;
+
+    format!(
+        "interface.{}.{}",
+        pkg_name.namespace.to_moonbit_ident(),
+        pkg_name.name.to_moonbit_ident()
+    )
+}
+
+fn interface_name_id_with_package(resolve: &Resolve, pkg: PackageId) -> String {
+    let pkg_name = &resolve.packages[pkg].name;
+
+    format!(
+        "interface.{}.{}",
+        pkg_name.namespace.to_moonbit_ident(),
+        pkg_name.name.to_moonbit_ident()
+    )
+}
+
+fn import_interface_name(resolve: &Resolve, name: &WorldKey) -> InterfaceInfo {
+    let pkg = match name {
+        WorldKey::Name(_) => None,
+        WorldKey::Interface(id) => {
+            let pkg = resolve.interfaces[*id].package.unwrap();
+            Some(resolve.packages[pkg].name.clone())
+        }
+    };
+
+    let name = match name {
+        WorldKey::Name(name) => name,
+        WorldKey::Interface(id) => resolve.interfaces[*id].name.as_ref().unwrap(),
+    }
+    .to_lower_camel_case();
+
+    let interface_name = format!(
+        "interface.{}{name}",
+        if let Some(name) = &pkg {
+            format!(
+                "{}.{}.",
+                name.namespace.to_moonbit_ident(),
+                name.name.to_moonbit_ident()
+            )
+        } else {
+            String::new()
+        }
+    );
+
+    InterfaceInfo {
+        package: pkg.unwrap(),
+        name: name.to_lower_camel_case(),
+        interface_name,
+    }
 }
 
 fn interface_name(resolve: &Resolve, name: &WorldKey) -> String {
